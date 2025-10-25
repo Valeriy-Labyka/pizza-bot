@@ -8,6 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.exceptions import TelegramBadRequest
 from aiohttp import web
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -93,7 +94,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 async def clear_active_messages(user_id: int, bot_instance: Bot):
     data = user_active_messages.get(user_id)
-    if data:  # ← ИСПРАВЛЕНО: было "if" без условия!
+    if data:
         for msg_id in data.get("message_ids", []):
             try:
                 await bot_instance.delete_message(chat_id=user_id, message_id=msg_id)
@@ -283,7 +284,6 @@ async def add_to_cart(callback: types.CallbackQuery, state: FSMContext):
             "base_price": base_price,
             "ingredients": {}
         }
-        # ✅ ИСПРАВЛЕНО: edit_caption вместо edit_text
         await callback.message.edit_caption(
             caption=f"🍕 <b>Соберите свою пиццу ({size_name})</b>\n"
                     f"Основа: {base_price}₽\n\nВыберите ингредиенты:",
@@ -333,7 +333,6 @@ async def custom_add_ingredient(callback: types.CallbackQuery, state: FSMContext
     current = pizza_data["ingredients"].get(ingredient_key, 0)
     pizza_data["ingredients"][ingredient_key] = current + 50
 
-    # ✅ ИСПРАВЛЕНО: edit_caption
     await callback.message.edit_caption(
         caption=f"🍕 <b>Соберите свою пиццу ({'Маленькая' if pizza_data['size'] == 'small' else 'Большая'})</b>\n"
                 f"Основа: {pizza_data['base_price']}₽\n\nВыберите ингредиенты:",
@@ -392,7 +391,14 @@ async def custom_done(callback: types.CallbackQuery, state: FSMContext):
 async def show_cart_by_callback(callback: types.CallbackQuery):
     cart = user_carts.get(callback.from_user.id, {})
     if not cart:
-        await callback.message.edit_text("📭 Корзина пуста.", parse_mode="HTML")
+        try:
+            await callback.message.edit_text("📭 Корзина пуста.", parse_mode="HTML")
+        except TelegramBadRequest as e:
+            if "there is no text in the message to edit" in str(e):
+                await callback.message.answer("📭 Корзина пуста.", parse_mode="HTML")
+                await callback.message.delete()
+            else:
+                raise
         return
 
     subtotal = sum(item["price_per_unit"] * item["quantity"] for item in cart.values())
@@ -411,7 +417,21 @@ async def show_cart_by_callback(callback: types.CallbackQuery):
     text += f"🚚 Доставка: {'Бесплатно' if delivery_cost == 0 else f'{delivery_cost}₽'}\n"
     text += f"\n<b>Итого к оплате: {total_with_delivery}₽</b>"
 
-    await callback.message.edit_text(text, reply_markup=cart_keyboard(), parse_mode="HTML")
+    try:
+        if callback.message.text is not None:
+            await callback.message.edit_text(text, reply_markup=cart_keyboard(), parse_mode="HTML")
+        else:
+            # Это медиа-сообщение или без текста
+            await callback.message.answer(text, reply_markup=cart_keyboard(), parse_mode="HTML")
+            await callback.message.delete()
+    except TelegramBadRequest as e:
+        if "there is no text in the message to edit" in str(e):
+            await callback.message.answer(text, reply_markup=cart_keyboard(), parse_mode="HTML")
+            await callback.message.delete()
+        else:
+            raise
+
+    await callback.answer()
 
 
 @dp.message(F.text == "🛒 Корзина")
@@ -444,7 +464,10 @@ async def show_cart(message: types.Message):
 async def clear_cart(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     user_carts.pop(callback.from_user.id, None)
-    await callback.message.edit_text("🗑 Корзина очищена.", parse_mode="HTML")
+    try:
+        await callback.message.edit_text("🗑 Корзина очищена.", parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
     is_admin = (callback.from_user.id == ADMIN_USER_ID)
     await callback.message.answer("📂 Выберите раздел:", reply_markup=main_menu(is_admin=is_admin), parse_mode="HTML")
 
@@ -472,7 +495,10 @@ async def cart_manage(callback: types.CallbackQuery):
         del cart[item_key]
 
     if not cart:
-        await callback.message.edit_text("📭 Корзина пуста.", parse_mode="HTML")
+        try:
+            await callback.message.edit_text("📭 Корзина пуста.", parse_mode="HTML")
+        except TelegramBadRequest:
+            await callback.message.answer("📭 Корзина пуста.", parse_mode="HTML")
         return
 
     item = cart.get(item_key)
@@ -836,7 +862,7 @@ async def on_shutdown(app):
     logger.info("🛑 Завершение работы бота...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await bot.session.close()  # 🔑 КЛЮЧЕВОЕ: закрытие сессии
+        await bot.session.close()
     except Exception as e:
         logger.error(f"Ошибка при завершении: {e}")
     logger.info("✅ Бот остановлен.")

@@ -5,8 +5,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("❌ Переменная BOT_TOKEN не установлена!")
 
+admin_user_id_raw = os.getenv("ADMIN_USER_ID")
+if not admin_user_id_raw:
+    raise ValueError("❌ Переменная ADMIN_USER_ID не установлена!")
+
 try:
-    ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", ""))
+    ADMIN_USER_ID = int(admin_user_id_raw)
 except (ValueError, TypeError):
     raise ValueError("❌ Переменная ADMIN_USER_ID должна быть целым числом!")
 

@@ -39,6 +39,10 @@ def product_buttons(product_id: str, price_small: int = None, price_large: int =
 
 
 def cart_item_buttons(item_key: str, quantity: int):
+    # Защита от отрицательного количества
+    if quantity <= 0:
+        return cart_keyboard()  # Возвращаем основную клавиатуру корзины
+
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="➖", callback_data=f"cart_dec_{item_key}"),
