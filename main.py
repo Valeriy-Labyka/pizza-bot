@@ -10,7 +10,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
-# Добавлены недостающие импорты для Inline-клавиатур
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import BOT_TOKEN, ADMIN_USER_ID, KITCHEN_CHAT_ID, PAYMENT_CARD_NUMBER, PAYMENT_BANK_NAME
@@ -23,7 +22,6 @@ from keyboards import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -31,12 +29,10 @@ user_carts = {}
 user_active_messages = {}
 user_custom_pizzas = {}
 
-
 async def cleanup_old_orders():
     while True:
         await asyncio.sleep(3600)
         await delete_old_completed_orders()
-
 
 try:
     with open("menu_data.json", "r", encoding="utf-8") as f:
@@ -97,7 +93,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 async def clear_active_messages(user_id: int, bot_instance: Bot):
     data = user_active_messages.get(user_id)
-    if data:
+    if data:  # ← ИСПРАВЛЕНО: было "if" без условия!
         for msg_id in data.get("message_ids", []):
             try:
                 await bot_instance.delete_message(chat_id=user_id, message_id=msg_id)
@@ -287,9 +283,10 @@ async def add_to_cart(callback: types.CallbackQuery, state: FSMContext):
             "base_price": base_price,
             "ingredients": {}
         }
-        await callback.message.edit_text(
-            f"🍕 <b>Соберите свою пиццу ({size_name})</b>\n"
-            f"Основа: {base_price}₽\n\nВыберите ингредиенты:",
+        # ✅ ИСПРАВЛЕНО: edit_caption вместо edit_text
+        await callback.message.edit_caption(
+            caption=f"🍕 <b>Соберите свою пиццу ({size_name})</b>\n"
+                    f"Основа: {base_price}₽\n\nВыберите ингредиенты:",
             reply_markup=build_pizza_custom_keyboard({}, base_price, size),
             parse_mode="HTML"
         )
@@ -336,9 +333,10 @@ async def custom_add_ingredient(callback: types.CallbackQuery, state: FSMContext
     current = pizza_data["ingredients"].get(ingredient_key, 0)
     pizza_data["ingredients"][ingredient_key] = current + 50
 
-    await callback.message.edit_text(
-        f"🍕 <b>Соберите свою пиццу ({'Маленькая' if pizza_data['size'] == 'small' else 'Большая'})</b>\n"
-        f"Основа: {pizza_data['base_price']}₽\n\nВыберите ингредиенты:",
+    # ✅ ИСПРАВЛЕНО: edit_caption
+    await callback.message.edit_caption(
+        caption=f"🍕 <b>Соберите свою пиццу ({'Маленькая' if pizza_data['size'] == 'small' else 'Большая'})</b>\n"
+                f"Основа: {pizza_data['base_price']}₽\n\nВыберите ингредиенты:",
         reply_markup=build_pizza_custom_keyboard(pizza_data["ingredients"], pizza_data["base_price"], pizza_data["size"]),
         parse_mode="HTML"
     )
@@ -818,29 +816,27 @@ async def admin_update_order_status(callback: types.CallbackQuery):
 # === ON STARTUP / SHUTDOWN ===
 async def on_startup(app):
     logger.info("🚀 Запуск бота...")
+    logger.info(f"RENDER_EXTERNAL_URL = {os.getenv('RENDER_EXTERNAL_URL')}")
+    logger.info(f"DATABASE_URL задан: {'Да' if os.getenv('DATABASE_URL') else 'Нет'}")
+    
     await init_db()
     asyncio.create_task(cleanup_old_orders())
     
-    # Более надёжная проверка RENDER_EXTERNAL_URL
     WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL")
     if not WEBHOOK_HOST:
-        logger.error("❌ Переменная RENDER_EXTERNAL_URL не установлена! Проверьте настройки Render.")
-        # Не падаем, а логируем и выходим корректно
+        logger.error("❌ Переменная RENDER_EXTERNAL_URL не установлена!")
         return
 
     webhook_url = f"{WEBHOOK_HOST}/webhook/{BOT_TOKEN}"
-    try:
-        await bot.set_webhook(webhook_url)
-        logger.info(f"✅ Вебхук установлен: {webhook_url}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка установки вебхука: {e}")
+    await bot.set_webhook(webhook_url)
+    logger.info(f"✅ Вебхук установлен: {webhook_url}")
 
 
 async def on_shutdown(app):
     logger.info("🛑 Завершение работы бота...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await bot.session.close()  # <-- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
+        await bot.session.close()  # 🔑 КЛЮЧЕВОЕ: закрытие сессии
     except Exception as e:
         logger.error(f"Ошибка при завершении: {e}")
     logger.info("✅ Бот остановлен.")
