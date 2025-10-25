@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+from datetime import datetime, timedelta, timezone
 import asyncpg
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,7 @@ async def init_db():
         raise
 
     async with pool.acquire() as conn:
+        # Используем TIMESTAMP WITH TIME ZONE для корректной работы с UTC
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id SERIAL PRIMARY KEY,
@@ -29,7 +31,7 @@ async def init_db():
                 phone TEXT,
                 payment_method TEXT,
                 status TEXT DEFAULT 'new',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             )
         """)
 
@@ -147,8 +149,8 @@ async def update_order_status(order_id: int, new_status: str):
 
 
 async def delete_old_completed_orders():
-    from datetime import datetime, timedelta
-    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+    # Используем UTC для согласованности
+    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
     async with pool.acquire() as conn:
         result = await conn.execute(
             "DELETE FROM orders WHERE status = ANY($1) AND created_at < $2",

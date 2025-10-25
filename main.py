@@ -23,6 +23,7 @@ from keyboards import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -30,10 +31,12 @@ user_carts = {}
 user_active_messages = {}
 user_custom_pizzas = {}
 
+
 async def cleanup_old_orders():
     while True:
         await asyncio.sleep(3600)
         await delete_old_completed_orders()
+
 
 try:
     with open("menu_data.json", "r", encoding="utf-8") as f:
@@ -450,7 +453,11 @@ async def clear_cart(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("cart_"))
 async def cart_manage(callback: types.CallbackQuery):
-    action, item_key = callback.data.split("_", 2)[1:]
+    parts = callback.data.split("_", 2)
+    if len(parts) < 3:
+        await callback.answer("❌ Некорректная команда.", show_alert=True)
+        return
+    action, item_key = parts[1], parts[2]
     cart = user_carts.get(callback.from_user.id, {})
     if item_key not in cart:
         await callback.answer("❌ Товар не найден в корзине.", show_alert=True)
@@ -715,12 +722,9 @@ async def admin_show_orders(callback: types.CallbackQuery):
     for order in active_orders:
         status_emoji = {"new": "🆕", "cooking": "🍳", "delivery": "🚚", "done": "✅", "cancelled": "❌"}.get(order['status'], "❓")
         btn_text = f"{status_emoji} Заказ #{order['id']} ({order['total']}₽)"
-        # Используем InlineKeyboardButton явно
         keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"admin_order_{order['id']}")])
     
-    # Кнопка «Назад»
     keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_admin")])
-    # Создаем разметку
     reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
 
     await callback.message.answer("📦 <b>Активные заказы:</b>", reply_markup=reply_markup, parse_mode="HTML")
@@ -777,7 +781,6 @@ async def show_admin_order_details(callback: types.CallbackQuery):
     for item in items:
         text += f"• {item.get('name', '—')} ×{item.get('quantity', 1)}\n"
 
-    # Здесь используется функция из keyboards.py — она должна возвращать InlineKeyboardMarkup
     await callback.message.edit_text(text, reply_markup=order_status_buttons(row['id'], row['status']), parse_mode="HTML")
 
 
@@ -814,21 +817,33 @@ async def admin_update_order_status(callback: types.CallbackQuery):
 
 # === ON STARTUP / SHUTDOWN ===
 async def on_startup(app):
+    logger.info("🚀 Запуск бота...")
     await init_db()
     asyncio.create_task(cleanup_old_orders())
     
+    # Более надёжная проверка RENDER_EXTERNAL_URL
     WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL")
     if not WEBHOOK_HOST:
-        raise ValueError("Переменная RENDER_EXTERNAL_URL не установлена!")
-    
+        logger.error("❌ Переменная RENDER_EXTERNAL_URL не установлена! Проверьте настройки Render.")
+        # Не падаем, а логируем и выходим корректно
+        return
+
     webhook_url = f"{WEBHOOK_HOST}/webhook/{BOT_TOKEN}"
-    await bot.set_webhook(webhook_url)
-    logger.info(f"✅ Бот запущен. Вебхук установлен на: {webhook_url}")
+    try:
+        await bot.set_webhook(webhook_url)
+        logger.info(f"✅ Вебхук установлен: {webhook_url}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка установки вебхука: {e}")
 
 
 async def on_shutdown(app):
-    await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("🛑 Бот остановлен.")
+    logger.info("🛑 Завершение работы бота...")
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.session.close()  # <-- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
+    except Exception as e:
+        logger.error(f"Ошибка при завершении: {e}")
+    logger.info("✅ Бот остановлен.")
 
 
 # === MAIN ===

@@ -13,6 +13,7 @@ def main_menu(is_admin: bool = False):
         keyboard.append([KeyboardButton(text="🔐 Админка")])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
+
 def phone_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -21,6 +22,7 @@ def phone_keyboard():
         resize_keyboard=True,
         one_time_keyboard=True
     )
+
 
 def product_buttons(product_id: str, price_small: int = None, price_large: int = None):
     keyboard = []
@@ -35,6 +37,7 @@ def product_buttons(product_id: str, price_small: int = None, price_large: int =
         ])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
+
 def cart_item_buttons(item_key: str, quantity: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -46,12 +49,14 @@ def cart_item_buttons(item_key: str, quantity: int):
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_to_main")]
     ])
 
+
 def cart_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Оформить заказ", callback_data="checkout")],
         [InlineKeyboardButton(text="🗑 Очистить корзину", callback_data="clear_cart")],
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_to_main")]
     ])
+
 
 def payment_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -60,14 +65,15 @@ def payment_keyboard():
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_cart")]
     ])
 
+
 def admin_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Все заказы", callback_data="admin_orders")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
     ])
 
+
 def order_status_buttons(order_id: int, current_status: str = "new"):
-    buttons = []
     status_map = {
         "new": ["cooking", "cancelled"],
         "cooking": ["delivery", "done", "cancelled"],
@@ -77,6 +83,7 @@ def order_status_buttons(order_id: int, current_status: str = "new"):
     }
     available_transitions = status_map.get(current_status, [])
 
+    buttons = []
     if "cooking" in available_transitions:
         buttons.append(InlineKeyboardButton(text="🍳 Готовится", callback_data=f"status_cooking_{order_id}"))
     if "delivery" in available_transitions:
@@ -86,18 +93,13 @@ def order_status_buttons(order_id: int, current_status: str = "new"):
     if "cancelled" in available_transitions:
         buttons.append(InlineKeyboardButton(text="❌ Отменить", callback_data=f"status_cancel_{order_id}"))
 
-    # Разбиваем на два ряда для лучшей читаемости
-    action_buttons = buttons[:-1]
-    back_button = buttons[-1] if buttons else InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_order_{order_id}")
-    
     keyboard = []
-    if action_buttons:
-        # Разбиваем по 2 кнопки в ряд
-        for i in range(0, len(action_buttons), 2):
-            keyboard.append(action_buttons[i:i+2])
-    keyboard.append([back_button])
-    
+    for i in range(0, len(buttons), 2):
+        keyboard.append(buttons[i:i+2])
+    keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_order_{order_id}")])
+
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
 
 INGREDIENTS = {
     "tomato": ("Помидоры", 20),
@@ -121,6 +123,7 @@ INGREDIENTS = {
     "gorgonzola": ("Горгонзола", 50),
     "feta": ("Фета", 30)
 }
+
 
 def build_pizza_custom_keyboard(selected: dict, base_price: int, size: str):
     lines = []
