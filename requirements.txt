@@ -1,5 +1,6 @@
 --only-binary=asyncpg
-asyncpg==0.30.0
 aiogram==3.13.0
+asyncpg==0.30.0
 python-dotenv==1.1.1
 aiofiles==23.2.1
+aiohttp==3.10.11

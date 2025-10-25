@@ -9,9 +9,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.exceptions import TelegramBadRequest
-from aiohttp import web
-
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiohttp import web
+import aiofiles
 
 from config import BOT_TOKEN, ADMIN_USER_ID, KITCHEN_CHAT_ID, PAYMENT_CARD_NUMBER, PAYMENT_BANK_NAME
 from database import init_db, save_order, get_user_orders, get_all_orders, update_order_status, delete_old_completed_orders
@@ -30,30 +30,18 @@ user_carts = {}
 user_active_messages = {}
 user_custom_pizzas = {}
 
-async def cleanup_old_orders():
-    while True:
-        await asyncio.sleep(3600)
-        await delete_old_completed_orders()
 
-try:
-    with open("menu_data.json", "r", encoding="utf-8") as f:
-        MENU_DATA = json.load(f)
-    logger.info("Файл menu_data.json успешно загружен.")
-except Exception as e:
-    logger.error(f"Ошибка при загрузке menu_data.json: {e}")
-    MENU_DATA = {}
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 
-
-class OrderFlow(StatesGroup):
-    waiting_for_address = State()
-    waiting_for_phone = State()
-    waiting_for_payment = State()
-    waiting_for_receipt = State()
-    custom_pizza = State()
-
-
-class AdminFlow(StatesGroup):
-    waiting_for_order_id = State()
+async def clear_active_messages(user_id: int, bot_instance: Bot):
+    data = user_active_messages.get(user_id)
+    if data:
+        for msg_id in data.get("message_ids", []):
+            try:
+                await bot_instance.delete_message(chat_id=user_id, message_id=msg_id)
+            except Exception:
+                pass
+        user_active_messages.pop(user_id, None)
 
 
 def get_item_key(category: str, item_index: int, size: str = None, custom: bool = False, ingredients: dict = None):
@@ -79,6 +67,45 @@ def add_to_cart_safe(user_id: int, item_key: str, name: str, price_per_unit: int
         }
 
 
+async def cleanup_old_orders():
+    while True:
+        await asyncio.sleep(3600)
+        await delete_old_completed_orders()
+
+
+# === ЗАГРУЗКА МЕНЮ ===
+
+try:
+    # Проверяем существование файла асинхронно
+    if not os.path.exists("menu_data.json"):
+        logger.error("Файл menu_data.json не найден!")
+        MENU_DATA = {}
+    else:
+        async with aiofiles.open("menu_data.json", mode="r", encoding="utf-8") as f:
+            content = await f.read()
+            MENU_DATA = json.loads(content)
+        logger.info("Файл menu_data.json успешно загружен.")
+except Exception as e:
+    logger.error(f"Ошибка при загрузке menu_data.json: {e}")
+    MENU_DATA = {}
+
+
+# === СОСТОЯНИЯ ===
+
+class OrderFlow(StatesGroup):
+    waiting_for_address = State()
+    waiting_for_phone = State()
+    waiting_for_payment = State()
+    waiting_for_receipt = State()
+    custom_pizza = State()
+
+
+class AdminFlow(StatesGroup):
+    waiting_for_order_id = State()
+
+
+# === ОБРАБОТЧИКИ ===
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -90,17 +117,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         reply_markup=main_menu(is_admin=is_admin),
         parse_mode="HTML"
     )
-
-
-async def clear_active_messages(user_id: int, bot_instance: Bot):
-    data = user_active_messages.get(user_id)
-    if data:
-        for msg_id in data.get("message_ids", []):
-            try:
-                await bot_instance.delete_message(chat_id=user_id, message_id=msg_id)
-            except Exception:
-                pass
-        user_active_messages.pop(user_id, None)
 
 
 @dp.message(F.text.in_({"🍕 Меню пицц", "🥗 Салаты и закуски", "🥤 Напитки"}))
@@ -142,17 +158,22 @@ async def show_category(message: types.Message, state: FSMContext):
 
         image_path = item.get("image_url", "").strip()
         try:
+            # Проверяем, является ли путь URL или локальным файлом
+            if image_path.startswith(('http://', 'https://')):
+                photo_input = image_path
+            else:
+                # Для Render изображения должны быть доступны по URL, поэтому локальные файлы нужно хранить в статике или использовать прямые ссылки
+                # На Render локальные файлы могут не работать, лучше использовать URL
+                # logger.warning(f"Локальный файл изображения '{image_path}' может не работать на Render. Рекомендуется использовать URL.")
+                photo_input = image_path # Попробуем, но в идеале - URL
             sent = await message.answer_photo(
-                photo=types.FSInputFile(image_path),
+                photo=photo_input,
                 caption=caption,
                 reply_markup=kb,
                 parse_mode="HTML"
             )
-        except FileNotFoundError:
-            logger.warning(f"Файл не найден: {image_path}")
-            sent = await message.answer(caption, reply_markup=kb, parse_mode="HTML")
         except Exception as e:
-            logger.warning(f"Не удалось отправить фото для {item['name']}: {e}")
+            logger.warning(f"Не удалось отправить фото для {item['name']}: {e}. Попытка отправки без фото.")
             sent = await message.answer(caption, reply_markup=kb, parse_mode="HTML")
         sent_ids.append(sent.message_id)
 
@@ -160,68 +181,6 @@ async def show_category(message: types.Message, state: FSMContext):
         "category": category,
         "message_ids": sent_ids
     }
-
-
-@dp.message(F.text.in_({"🛒 Корзина", "ℹ️ О нас / Доставка", "🔐 Админка"}))
-async def handle_main_menu_buttons(message: types.Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state and current_state != OrderFlow.waiting_for_receipt.state:
-        await state.clear()
-        is_admin = (message.from_user.id == ADMIN_USER_ID)
-        await message.answer("❌ Процесс оформления заказа отменён. Вы в главном меню.", reply_markup=main_menu(is_admin=is_admin), parse_mode="HTML")
-
-    if message.text == "🛒 Корзина":
-        await show_cart(message)
-    elif message.text == "ℹ️ О нас / Доставка":
-        await about(message)
-    elif message.text == "🔐 Админка":
-        await admin_cmd(message)
-
-
-@dp.message(F.text == "📍 Мои заказы")
-async def my_orders(message: types.Message, state: FSMContext):
-    await state.clear()
-    all_orders = await get_user_orders(message.from_user.id)
-    if not all_orders:
-        await message.answer("📭 У вас пока нет заказов.", parse_mode="HTML")
-        return
-
-    active_orders = [order for order in all_orders if order["status"] not in ('done', 'cancelled')]
-    if not active_orders:
-        await message.answer("📭 У вас нет активных заказов.", parse_mode="HTML")
-        return
-
-    status_map = {
-        "new": "🆕 Новый",
-        "cooking": "🍳 Готовится",
-        "delivery": "🚚 Доставляется",
-        "done": "✅ Завершён",
-        "cancelled": "❌ Отменён"
-    }
-    text = "📦 <b>Ваши активные заказы:</b>\n\n"
-    for i, order in enumerate(active_orders, 1):
-        status = status_map.get(order["status"], order["status"])
-        created_at_str = order["created_at"].strftime('%d.%m.%Y %H:%M')
-        text += (
-            f"<b>{i}.</b> Сумма: <b>{order['total']}₽</b>\n"
-            f"Адрес: {order['address']}\n"
-            f"Оплата: {order['payment_method']}\n"
-            f"Статус: {status}\n"
-            f"Время: {created_at_str}\n\n"
-        )
-    await message.answer(text, parse_mode="HTML")
-
-
-@dp.callback_query(F.data.startswith("back_to_"))
-async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await clear_active_messages(callback.from_user.id, bot)
-    is_admin = (callback.from_user.id == ADMIN_USER_ID)
-    await callback.message.answer("📂 Выберите раздел:", reply_markup=main_menu(is_admin=is_admin), parse_mode="HTML")
-    try:
-        await callback.message.delete()
-    except:
-        pass
 
 
 @dp.callback_query(F.data.startswith("add_"))
@@ -317,193 +276,6 @@ async def add_to_cart(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer(f"✅ {name} добавлена в корзину!")
 
 
-@dp.callback_query(OrderFlow.custom_pizza, F.data.startswith("custom_add_"))
-async def custom_add_ingredient(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if user_id not in user_custom_pizzas:
-        await callback.answer("❌ Сессия устарела. Начните заново.", show_alert=True)
-        return
-
-    ingredient_key = callback.data.replace("custom_add_", "")
-    if ingredient_key not in INGREDIENTS:
-        await callback.answer("❌ Неизвестный ингредиент.", show_alert=True)
-        return
-
-    pizza_data = user_custom_pizzas[user_id]
-    current = pizza_data["ingredients"].get(ingredient_key, 0)
-    pizza_data["ingredients"][ingredient_key] = current + 50
-
-    await callback.message.edit_caption(
-        caption=f"🍕 <b>Соберите свою пиццу ({'Маленькая' if pizza_data['size'] == 'small' else 'Большая'})</b>\n"
-                f"Основа: {pizza_data['base_price']}₽\n\nВыберите ингредиенты:",
-        reply_markup=build_pizza_custom_keyboard(pizza_data["ingredients"], pizza_data["base_price"], pizza_data["size"]),
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(OrderFlow.custom_pizza, F.data == "custom_cancel")
-async def custom_cancel(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_custom_pizzas.pop(callback.from_user.id, None)
-    await back_to_main(callback, state)
-
-
-@dp.callback_query(OrderFlow.custom_pizza, F.data == "custom_done")
-async def custom_done(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    if user_id not in user_custom_pizzas:
-        await callback.answer("❌ Сессия устарела.", show_alert=True)
-        return
-
-    pizza_data = user_custom_pizzas[user_id]
-    total_extra = sum((grams // 50) * INGREDIENTS[k][1] for k, grams in pizza_data["ingredients"].items())
-    total_price = pizza_data["base_price"] + total_extra
-
-    size_name = "Маленькая" if pizza_data["size"] == "small" else "Большая"
-    ingredients_list = []
-    for k, grams in pizza_data["ingredients"].items():
-        if grams > 0:
-            name = INGREDIENTS[k][0]
-            ingredients_list.append(f"{name} {grams}г")
-    ingredients_str = ", ".join(ingredients_list) if ingredients_list else "без добавок"
-    name = f"Пицца Собери сам ({size_name})"
-
-    item_key = get_item_key("Пиццы", -1, pizza_data["size"], custom=True, ingredients=pizza_data["ingredients"])
-    add_to_cart_safe(
-        user_id,
-        item_key,
-        name,
-        total_price,
-        1,
-        details={
-            "size": size_name,
-            "base_price": pizza_data["base_price"],
-            "ingredients": dict(pizza_data["ingredients"])
-        }
-    )
-
-    await callback.answer("✅ Пицца добавлена в корзину!", show_alert=True)
-    await state.clear()
-    user_custom_pizzas.pop(user_id, None)
-
-    # === ИСПРАВЛЕНИЕ: не редактируем фото, а отправляем новое сообщение с корзиной ===
-    cart = user_carts.get(user_id, {})
-    if not cart:
-        await callback.message.answer("📭 Корзина пуста.", parse_mode="HTML")
-        try:
-            await callback.message.delete()
-        except:
-            pass
-        return
-
-    subtotal = sum(item["price_per_unit"] * item["quantity"] for item in cart.values())
-    delivery_cost = 0 if subtotal >= 800 else 150
-    total_with_delivery = subtotal + delivery_cost
-
-    text = "🛒 <b>Ваш заказ:</b>\n\n"
-    for item_key, item in cart.items():
-        name = item["name"]
-        if "Собери сам" in name and "details" in item:
-            details = item["details"]
-            ingredients_str = ", ".join([f"{INGREDIENTS[k][0]} {v}г" for k, v in details["ingredients"].items()])
-            name = f"{name} + {ingredients_str}"
-        text += f"• {name} — <b>{item['price_per_unit']}₽</b> × {item['quantity']} = <b>{item['price_per_unit'] * item['quantity']}₽</b>\n"
-    text += f"\n📦 Сумма товаров: <b>{subtotal}₽</b>\n"
-    text += f"🚚 Доставка: {'Бесплатно' if delivery_cost == 0 else f'{delivery_cost}₽'}\n"
-    text += f"\n<b>Итого к оплате: {total_with_delivery}₽</b>"
-
-    # Удаляем старое фото-сообщение
-    try:
-        await callback.message.delete()
-    except:
-        pass
-
-    # Отправляем новое текстовое сообщение с корзиной
-    await callback.message.answer(text, reply_markup=cart_keyboard(), parse_mode="HTML")
-
-
-async def show_cart_by_callback(callback: types.CallbackQuery):
-    cart = user_carts.get(callback.from_user.id, {})
-    if not cart:
-        try:
-            if callback.message.text is not None:
-                await callback.message.edit_text("📭 Корзина пуста.", parse_mode="HTML")
-            else:
-                await callback.message.answer("📭 Корзина пуста.", parse_mode="HTML")
-                await callback.message.delete()
-        except TelegramBadRequest as e:
-            if "there is no text in the message to edit" in str(e):
-                await callback.message.answer("📭 Корзина пуста.", parse_mode="HTML")
-                try:
-                    await callback.message.delete()
-                except:
-                    pass
-            else:
-                raise
-        return
-
-    subtotal = sum(item["price_per_unit"] * item["quantity"] for item in cart.values())
-    delivery_cost = 0 if subtotal >= 800 else 150
-    total_with_delivery = subtotal + delivery_cost
-
-    text = "🛒 <b>Ваш заказ:</b>\n\n"
-    for item_key, item in cart.items():
-        name = item["name"]
-        if "Собери сам" in name and "details" in item:
-            details = item["details"]
-            ingredients_str = ", ".join([f"{INGREDIENTS[k][0]} {v}г" for k, v in details["ingredients"].items()])
-            name = f"{name} + {ingredients_str}"
-        text += f"• {name} — <b>{item['price_per_unit']}₽</b> × {item['quantity']} = <b>{item['price_per_unit'] * item['quantity']}₽</b>\n"
-    text += f"\n📦 Сумма товаров: <b>{subtotal}₽</b>\n"
-    text += f"🚚 Доставка: {'Бесплатно' if delivery_cost == 0 else f'{delivery_cost}₽'}\n"
-    text += f"\n<b>Итого к оплате: {total_with_delivery}₽</b>"
-
-    try:
-        if callback.message.text is not None:
-            await callback.message.edit_text(text, reply_markup=cart_keyboard(), parse_mode="HTML")
-        else:
-            # Это медиа-сообщение или без текста — отправляем новое
-            await callback.message.answer(text, reply_markup=cart_keyboard(), parse_mode="HTML")
-            await callback.message.delete()
-    except TelegramBadRequest as e:
-        if "there is no text in the message to edit" in str(e):
-            await callback.message.answer(text, reply_markup=cart_keyboard(), parse_mode="HTML")
-            try:
-                await callback.message.delete()
-            except:
-                pass
-        else:
-            raise
-
-    await callback.answer()
-
-
-@dp.message(F.text == "🛒 Корзина")
-async def show_cart(message: types.Message):
-    cart = user_carts.get(message.from_user.id, {})
-    if not cart:
-        await message.answer("📭 Корзина пуста.", parse_mode="HTML")
-        return
-
-    subtotal = sum(item["price_per_unit"] * item["quantity"] for item in cart.values())
-    delivery_cost = 0 if subtotal >= 800 else 150
-    total_with_delivery = subtotal + delivery_cost
-
-    text = "🛒 <b>Ваш заказ:</b>\n\n"
-    for item_key, item in cart.items():
-        name = item["name"]
-        if "Собери сам" in name and "details" in item:
-            details = item["details"]
-            ingredients_str = ", ".join([f"{INGREDIENTS[k][0]} {v}г" for k, v in details["ingredients"].items()])
-            name = f"{name} + {ingredients_str}"
-        text += f"• {name} — <b>{item['price_per_unit']}₽</b> × {item['quantity']} = <b>{item['price_per_unit'] * item['quantity']}₽</b>\n"
-    text += f"\n📦 Сумма товаров: <b>{subtotal}₽</b>\n"
-    text += f"🚚 Доставка: {'Бесплатно' if delivery_cost == 0 else f'{delivery_cost}₽'}\n"
-    text += f"\n<b>Итого к оплате: {total_with_delivery}₽</b>"
-
-    await message.answer(text, reply_markup=cart_keyboard(), parse_mode="HTML")
-
-
 @dp.callback_query(F.data == "clear_cart")
 async def clear_cart(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -540,62 +312,203 @@ async def cart_manage(callback: types.CallbackQuery):
 
     if not cart:
         try:
-            await callback.message.edit_text("📭 Корзина пуста.", parse_mode="HTML")
+            await callback.message.edit_text("ostringstream пуста.", parse_mode="HTML")
         except TelegramBadRequest:
-            await callback.message.answer("📭 Корзина пуста.", parse_mode="HTML")
+            await callback.message.answer("ostringstream пуста.", parse_mode="HTML")
         return
 
     item = cart.get(item_key)
     if item:
         await callback.message.edit_reply_markup(reply_markup=cart_item_buttons(item_key, item["quantity"]))
     else:
+        # Если редактируемое сообщение уже не содержит товара — покажем обновлённую корзину
         await show_cart_by_callback(callback)
 
 
-@dp.callback_query(F.data == "checkout")
-async def checkout_start(callback: types.CallbackQuery, state: FSMContext):
+async def show_cart_by_callback(callback: types.CallbackQuery):
     cart = user_carts.get(callback.from_user.id, {})
     if not cart:
-        await callback.answer("📭 Корзина пуста!", show_alert=True)
+        try:
+            await callback.message.edit_text("ostringstream пуста.", parse_mode="HTML")
+        except TelegramBadRequest:
+            await callback.message.answer("ostringstream пуста.", parse_mode="HTML")
         return
 
-    await callback.message.answer(
-        "📍 Укажите адрес доставки и, при необходимости, дополнительные инструкции для курьера (подъезд, код, этаж и т.д.):",
+    subtotal = sum(item["price_per_unit"] * item["quantity"] for item in cart.values())
+    delivery_cost = 0 if subtotal >= 800 else 150
+    total_with_delivery = subtotal + delivery_cost
+
+    text = "🛒 <b>Ваш заказ:</b>\n\n"
+    for item_key, item in cart.items():
+        name = item["name"]
+        if "Собери сам" in name and "details" in item:
+            details = item["details"]
+            ingredients_str = ", ".join([f"{INGREDIENTS[k][0]} {v}г" for k, v in details["ingredients"].items()])
+            name = f"{name} + {ingredients_str}"
+        text += f"• {name} — <b>{item['price_per_unit']}₽</b> × {item['quantity']} = <b>{item['price_per_unit'] * item['quantity']}₽</b>\n"
+    text += f"\n📦 Сумма товаров: <b>{subtotal}₽</b>\n"
+    text += f"🚚 Доставка: {'Бесплатно' if delivery_cost == 0 else f'{delivery_cost}₽'}\n"
+    text += f"\n<b>Итого к оплате: {total_with_delivery}₽</b>"
+
+    try:
+        await callback.message.edit_text(text, reply_markup=cart_keyboard(), parse_mode="HTML")
+    except TelegramBadRequest:
+        await callback.message.answer(text, reply_markup=cart_keyboard(), parse_mode="HTML")
+
+
+@dp.message(F.text == "🛒 Корзина")
+async def show_cart(message: types.Message):
+    cart = user_carts.get(message.from_user.id, {})
+    if not cart:
+        await message.answer("ostringstream пуста.", parse_mode="HTML")
+        return
+
+    subtotal = sum(item["price_per_unit"] * item["quantity"] for item in cart.values())
+    delivery_cost = 0 if subtotal >= 800 else 150
+    total_with_delivery = subtotal + delivery_cost
+
+    text = "🛒 <b>Ваш заказ:</b>\n\n"
+    for item_key, item in cart.items():
+        name = item["name"]
+        if "Собери сам" in name and "details" in item:
+            details = item["details"]
+            ingredients_str = ", ".join([f"{INGREDIENTS[k][0]} {v}г" for k, v in details["ingredients"].items()])
+            name = f"{name} + {ingredients_str}"
+        text += f"• {name} — <b>{item['price_per_unit']}₽</b> × {item['quantity']} = <b>{item['price_per_unit'] * item['quantity']}₽</b>\n"
+    text += f"\n📦 Сумма товаров: <b>{subtotal}₽</b>\n"
+    text += f"🚚 Доставка: {'Бесплатно' if delivery_cost == 0 else f'{delivery_cost}₽'}\n"
+    text += f"\n<b>Итого к оплате: {total_with_delivery}₽</b>"
+
+    await message.answer(text, reply_markup=cart_keyboard(), parse_mode="HTML")
+
+
+@dp.message(F.text == "📍 Мои заказы")
+async def show_user_orders(message: types.Message):
+    orders = await get_user_orders(message.from_user.id)
+    if not orders:
+        await message.answer("📋 У вас пока нет заказов.", parse_mode="HTML")
+        return
+
+    text = "📋 <b>Ваши последние заказы:</b>\n\n"
+    for order in orders[:5]: # Показываем последние 5
+        status_map = {
+            "new": "🆕 Новый",
+            "cooking": "🍳 Готовится",
+            "delivery": "🚚 Доставляется",
+            "done": "✅ Завершён",
+            "cancelled": "❌ Отменён"
+        }
+        status_text = status_map.get(order['status'], order['status'])
+        text += f"• <b>Заказ #{order['id']}</b> — {status_text} ({order['total']}₽)\n"
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(F.text == "ℹ️ О нас / Доставка")
+async def about_info(message: types.Message):
+    text = (
+        "ℹ️ <b>О нас и доставке:</b>\n\n"
+        "Доставка пиццы по Калининграду.\n"
+        "Бесплатная доставка от 800₽.\n"
+        "Стоимость доставки: 150₽ (при заказе до 800₽).\n\n"
+        "СБП: Тинькофф / Сбербанк.\n\n"
+        "📞 Поддержка: +7 (952) 114-87-67"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(F.text == "🔐 Админка")
+async def admin_menu_button(message: types.Message):
+    if message.from_user.id == ADMIN_USER_ID:
+        await message.answer("🔐 <b>Админка:</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
+    else:
+        await message.answer("❌ Доступ запрещён.", parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "back_to_admin")
+async def back_to_admin(callback: types.CallbackQuery):
+    await callback.message.edit_text("🔐 <b>Админка:</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery):
+    is_admin = (callback.from_user.id == ADMIN_USER_ID)
+    await callback.message.edit_text(
+        "🍕 <b>Добро пожаловать в Pizza_Store39!</b>\n"
+        "Горячая пицца в Калининграде — быстро, вкусно, удобно!",
+        reply_markup=main_menu(is_admin=is_admin),
         parse_mode="HTML"
     )
-    await state.set_state(OrderFlow.waiting_for_address)
+
+
+@dp.message(F.contact)
+async def handle_phone_contact(message: types.Message, state: FSMContext):
+    if await state.get_state() == OrderFlow.waiting_for_phone:
+        phone_number = message.contact.phone_number
+        await state.update_data(phone=phone_number)
+        await message.answer(f"✅ Телефон: <code>{phone_number}</code> получен.", parse_mode="HTML")
+        data = await state.get_data()
+        if "address" in data:
+            await message.answer(
+                f"📍 Адрес: {data['address']}\n"
+                f"📞 Телефон: <code>{phone_number}</code>",
+                reply_markup=payment_keyboard(),
+                parse_mode="HTML"
+            )
+            await state.set_state(OrderFlow.waiting_for_payment)
+        else:
+            await message.answer("Введите адрес доставки:", parse_mode="HTML")
+            await state.set_state(OrderFlow.waiting_for_address)
+
+
+@dp.message(OrderFlow.waiting_for_phone)
+async def handle_phone_text(message: types.Message, state: FSMContext):
+    if await state.get_state() == OrderFlow.waiting_for_phone:
+        phone_number = message.text
+        # Простая валидация номера (может быть улучшена)
+        if phone_number.startswith(('+', '7', '8')) and len(phone_number) >= 10:
+            await state.update_data(phone=phone_number)
+            await message.answer(f"✅ Телефон: <code>{phone_number}</code> получен.", parse_mode="HTML")
+            data = await state.get_data()
+            if "address" in data:
+                await message.answer(
+                    f"📍 Адрес: {data['address']}\n"
+                    f"📞 Телефон: <code>{phone_number}</code>",
+                    reply_markup=payment_keyboard(),
+                    parse_mode="HTML"
+                )
+                await state.set_state(OrderFlow.waiting_for_payment)
+            else:
+                await message.answer("Введите адрес доставки:", parse_mode="HTML")
+                await state.set_state(OrderFlow.waiting_for_address)
+        else:
+            await message.answer("❌ Неверный формат номера. Введите номер в формате +7XXXXXXXXXX:", parse_mode="HTML")
 
 
 @dp.message(OrderFlow.waiting_for_address)
 async def handle_address(message: types.Message, state: FSMContext):
     await state.update_data(address=message.text)
-    await message.answer(
-        "📞 Укажите ваш номер телефона для связи:\n"
-        "• Нажмите кнопку <b>«Отправить номер»</b> ниже\n"
-        "• Или введите вручную",
-        reply_markup=phone_keyboard(),
-        parse_mode="HTML"
-    )
+    await message.answer("📞 Отправьте номер телефона для связи или введите его вручную:", reply_markup=phone_keyboard(), parse_mode="HTML")
     await state.set_state(OrderFlow.waiting_for_phone)
 
 
-@dp.message(OrderFlow.waiting_for_phone, F.contact)
-async def phone_contact(message: types.Message, state: FSMContext):
-    phone = message.contact.phone_number
-    await state.update_data(phone=phone)
-    await message.answer("💳 Выберите способ оплаты:", reply_markup=payment_keyboard(), parse_mode="HTML")
-    await state.set_state(OrderFlow.waiting_for_payment)
-
-
-@dp.message(OrderFlow.waiting_for_phone, F.text)
-async def phone_text(message: types.Message, state: FSMContext):
-    phone = message.text.strip()
-    if not phone.replace("+", "").replace(" ", "").replace("-", "").isdigit() or len(phone) < 10:
-        await message.answer("❌ Неверный формат номера. Пожалуйста, введите номер телефона заново.", parse_mode="HTML")
+@dp.message(F.text == "✅ Оформить заказ")
+async def initiate_checkout(message: types.Message, state: FSMContext):
+    cart = user_carts.get(message.from_user.id, {})
+    if not cart:
+        await message.answer("❌ Корзина пуста. Добавьте товары перед оформлением заказа.", parse_mode="HTML")
         return
-    await state.update_data(phone=phone)
-    await message.answer("💳 Выберите способ оплаты:", reply_markup=payment_keyboard(), parse_mode="HTML")
-    await state.set_state(OrderFlow.waiting_for_payment)
+    await message.answer("Введите адрес доставки:", parse_mode="HTML")
+    await state.set_state(OrderFlow.waiting_for_address)
+
+
+@dp.callback_query(F.data == "checkout")
+async def initiate_checkout_callback(callback: types.CallbackQuery, state: FSMContext):
+    cart = user_carts.get(callback.from_user.id, {})
+    if not cart:
+        await callback.answer("❌ Корзина пуста. Добавьте товары перед оформлением заказа.", show_alert=True)
+        return
+    await callback.message.answer("Введите адрес доставки:", parse_mode="HTML")
+    await state.set_state(OrderFlow.waiting_for_address)
 
 
 @dp.callback_query(OrderFlow.waiting_for_payment, F.data.startswith("pay_"))
@@ -753,21 +666,6 @@ async def receive_payment_info(message: types.Message, state: FSMContext):
     await message.answer("🙏 Спасибо за заказ! 🍕", reply_markup=main_menu(is_admin=is_admin), parse_mode="HTML")
 
 
-@dp.message(F.text == "ℹ️ О нас / Доставка")
-async def about(message: types.Message):
-    await message.answer(
-        "<b>🍕 Pizza_Store39</b>\n\n"
-        "📍 Адрес: г. Калининград, ул. Дм. Донского, 39\n"
-        "🕒 Работаем: ежедневно с 10:00 до 23:00\n\n"
-        "<b>🚚 Доставка:</b>\n"
-        "• Доставка: 150₽\n"
-        "• Бесплатно при заказе от 800₽\n"
-        "• Время: 30–60 минут\n\n"
-        "📞 Поддержка: <b>+7 (952) 114-87-67</b>",
-        parse_mode="HTML"
-    )
-
-
 @dp.message(Command("admin"))
 async def admin_cmd(message: types.Message):
     if message.from_user.id == ADMIN_USER_ID:
@@ -782,7 +680,7 @@ async def admin_show_orders(callback: types.CallbackQuery):
     active_orders = [order for order in all_orders if order["status"] not in ('done', 'cancelled')]
 
     if not active_orders:
-        await callback.message.answer("📭 Нет активных заказов.", parse_mode="HTML")
+        await callback.message.answer("ostringstream нет активных заказов.", parse_mode="HTML")
         await callback.answer()
         return
 
@@ -808,6 +706,9 @@ async def show_admin_order_details(callback: types.CallbackQuery):
         return
 
     from database import pool
+    if pool is None:
+        await callback.message.answer("❌ Ошибка: База данных недоступна.")
+        return
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, user_id, items, total, address, phone, payment_method, status, created_at FROM orders WHERE id = $1",
@@ -884,28 +785,27 @@ async def admin_update_order_status(callback: types.CallbackQuery):
 
 
 # === ON STARTUP / SHUTDOWN ===
-async def on_startup(app):
+
+async def on_startup(bot_app: web.Application):
     logger.info("🚀 Запуск бота...")
-    logger.info(f"RENDER_EXTERNAL_URL = {os.getenv('RENDER_EXTERNAL_URL')}")
+    # render_url = os.getenv('RENDER_EXTERNAL_URL')
+    # logger.info(f"RENDER_EXTERNAL_URL = {render_url}")
     logger.info(f"DATABASE_URL задан: {'Да' if os.getenv('DATABASE_URL') else 'Нет'}")
-    
     await init_db()
     asyncio.create_task(cleanup_old_orders())
-    
-    WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL")
-    if not WEBHOOK_HOST:
-        logger.error("❌ Переменная RENDER_EXTERNAL_URL не установлена!")
-        return
-
-    webhook_url = f"{WEBHOOK_HOST}/webhook/{BOT_TOKEN}"
-    await bot.set_webhook(webhook_url)
-    logger.info(f"✅ Вебхук установлен: {webhook_url}")
+    # if render_url:
+    #     webhook_url = f"{render_url.rstrip('/')}/webhook/{BOT_TOKEN}"
+    #     await bot.set_webhook(webhook_url)
+    #     logger.info(f"✅ Вебхук установлен: {webhook_url}")
+    # else:
+    #     logger.warning("⚠️ RENDER_EXTERNAL_URL не задан — вебхук не установлен!")
+    #     logger.warning("⚠️ На Render переменная RENDER_EXTERNAL_URL устанавливается автоматически.")
 
 
-async def on_shutdown(app):
+async def on_shutdown(bot_app: web.Application):
     logger.info("🛑 Завершение работы бота...")
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        # await bot.delete_webhook(drop_pending_updates=True)
         await bot.session.close()
     except Exception as e:
         logger.error(f"Ошибка при завершении: {e}")
@@ -913,10 +813,12 @@ async def on_shutdown(app):
 
 
 # === MAIN ===
+
 def main():
     app = web.Application()
     webhook_path = f"/webhook/{BOT_TOKEN}"
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=webhook_path)
+    setup_application(app, dp, bot=bot)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_shutdown)
     port = int(os.getenv("PORT", 8000))

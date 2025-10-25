@@ -3,6 +3,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 
+
 def main_menu(is_admin: bool = False):
     keyboard = [
         [KeyboardButton(text="🍕 Меню пицц"), KeyboardButton(text="🥗 Салаты и закуски")],
