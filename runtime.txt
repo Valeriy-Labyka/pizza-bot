@@ -1,1 +1,2 @@
+--only-binary=asyncpg
 python-3.12.9
