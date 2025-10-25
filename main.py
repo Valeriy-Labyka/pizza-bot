@@ -385,18 +385,59 @@ async def custom_done(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer("✅ Пицца добавлена в корзину!", show_alert=True)
     await state.clear()
     user_custom_pizzas.pop(user_id, None)
-    await show_cart_by_callback(callback)
+
+    # === ИСПРАВЛЕНИЕ: не редактируем фото, а отправляем новое сообщение с корзиной ===
+    cart = user_carts.get(user_id, {})
+    if not cart:
+        await callback.message.answer("📭 Корзина пуста.", parse_mode="HTML")
+        try:
+            await callback.message.delete()
+        except:
+            pass
+        return
+
+    subtotal = sum(item["price_per_unit"] * item["quantity"] for item in cart.values())
+    delivery_cost = 0 if subtotal >= 800 else 150
+    total_with_delivery = subtotal + delivery_cost
+
+    text = "🛒 <b>Ваш заказ:</b>\n\n"
+    for item_key, item in cart.items():
+        name = item["name"]
+        if "Собери сам" in name and "details" in item:
+            details = item["details"]
+            ingredients_str = ", ".join([f"{INGREDIENTS[k][0]} {v}г" for k, v in details["ingredients"].items()])
+            name = f"{name} + {ingredients_str}"
+        text += f"• {name} — <b>{item['price_per_unit']}₽</b> × {item['quantity']} = <b>{item['price_per_unit'] * item['quantity']}₽</b>\n"
+    text += f"\n📦 Сумма товаров: <b>{subtotal}₽</b>\n"
+    text += f"🚚 Доставка: {'Бесплатно' if delivery_cost == 0 else f'{delivery_cost}₽'}\n"
+    text += f"\n<b>Итого к оплате: {total_with_delivery}₽</b>"
+
+    # Удаляем старое фото-сообщение
+    try:
+        await callback.message.delete()
+    except:
+        pass
+
+    # Отправляем новое текстовое сообщение с корзиной
+    await callback.message.answer(text, reply_markup=cart_keyboard(), parse_mode="HTML")
 
 
 async def show_cart_by_callback(callback: types.CallbackQuery):
     cart = user_carts.get(callback.from_user.id, {})
     if not cart:
         try:
-            await callback.message.edit_text("📭 Корзина пуста.", parse_mode="HTML")
+            if callback.message.text is not None:
+                await callback.message.edit_text("📭 Корзина пуста.", parse_mode="HTML")
+            else:
+                await callback.message.answer("📭 Корзина пуста.", parse_mode="HTML")
+                await callback.message.delete()
         except TelegramBadRequest as e:
             if "there is no text in the message to edit" in str(e):
                 await callback.message.answer("📭 Корзина пуста.", parse_mode="HTML")
-                await callback.message.delete()
+                try:
+                    await callback.message.delete()
+                except:
+                    pass
             else:
                 raise
         return
@@ -421,13 +462,16 @@ async def show_cart_by_callback(callback: types.CallbackQuery):
         if callback.message.text is not None:
             await callback.message.edit_text(text, reply_markup=cart_keyboard(), parse_mode="HTML")
         else:
-            # Это медиа-сообщение или без текста
+            # Это медиа-сообщение или без текста — отправляем новое
             await callback.message.answer(text, reply_markup=cart_keyboard(), parse_mode="HTML")
             await callback.message.delete()
     except TelegramBadRequest as e:
         if "there is no text in the message to edit" in str(e):
             await callback.message.answer(text, reply_markup=cart_keyboard(), parse_mode="HTML")
-            await callback.message.delete()
+            try:
+                await callback.message.delete()
+            except:
+                pass
         else:
             raise
 
