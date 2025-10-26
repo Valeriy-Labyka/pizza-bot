@@ -10,8 +10,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+# Импортируем web из aiohttp — КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ
 from aiohttp import web
-import aiofiles
 
 from config import BOT_TOKEN, ADMIN_USER_ID, KITCHEN_CHAT_ID, PAYMENT_CARD_NUMBER, PAYMENT_BANK_NAME
 from database import init_db, save_order, get_user_orders, get_all_orders, update_order_status, delete_old_completed_orders
@@ -69,20 +70,19 @@ def add_to_cart_safe(user_id: int, item_key: str, name: str, price_per_unit: int
 
 async def cleanup_old_orders():
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(3600)  # раз в час
         await delete_old_completed_orders()
 
 
 # === ЗАГРУЗКА МЕНЮ ===
 
 try:
-    # Проверяем существование файла асинхронно
     if not os.path.exists("menu_data.json"):
         logger.error("Файл menu_data.json не найден!")
         MENU_DATA = {}
     else:
-        async with aiofiles.open("menu_data.json", mode="r", encoding="utf-8") as f:
-            content = await f.read()
+        with open("menu_data.json", mode="r", encoding="utf-8") as f:
+            content = f.read()
             MENU_DATA = json.loads(content)
         logger.info("Файл menu_data.json успешно загружен.")
 except Exception as e:
@@ -158,14 +158,10 @@ async def show_category(message: types.Message, state: FSMContext):
 
         image_path = item.get("image_url", "").strip()
         try:
-            # Проверяем, является ли путь URL или локальным файлом
             if image_path.startswith(('http://', 'https://')):
                 photo_input = image_path
             else:
-                # Для Render изображения должны быть доступны по URL, поэтому локальные файлы нужно хранить в статике или использовать прямые ссылки
-                # На Render локальные файлы могут не работать, лучше использовать URL
-                # logger.warning(f"Локальный файл изображения '{image_path}' может не работать на Render. Рекомендуется использовать URL.")
-                photo_input = image_path # Попробуем, но в идеале - URL
+                photo_input = image_path
             sent = await message.answer_photo(
                 photo=photo_input,
                 caption=caption,
@@ -276,6 +272,99 @@ async def add_to_cart(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer(f"✅ {name} добавлена в корзину!")
 
 
+# --- НОВЫЕ ОБРАБОТЧИКИ ДЛЯ "СОБЕРИ САМ" ---
+
+@dp.callback_query(F.data.startswith("custom_add_"))
+async def custom_add_ingredient(callback: types.CallbackQuery, state: FSMContext):
+    if await state.get_state() != OrderFlow.custom_pizza.state:
+        await callback.answer("❌ Сначала начните сборку пиццы.", show_alert=True)
+        return
+
+    ingredient_key = callback.data.replace("custom_add_", "")
+    if ingredient_key not in INGREDIENTS:
+        await callback.answer("❌ Неизвестный ингредиент.", show_alert=True)
+        return
+
+    user_data = user_custom_pizzas.get(callback.from_user.id)
+    if not user_data:
+        await callback.answer("❌ Ошибка данных сборки. Начните заново.", show_alert=True)
+        await state.clear()
+        return
+
+    current_ingredients = user_data["ingredients"]
+    current_grams = current_ingredients.get(ingredient_key, 0)
+    new_grams = current_grams + 50 if current_grams == 0 else 0
+    current_ingredients[ingredient_key] = new_grams
+
+    # Перерисовываем клавиатуру с обновлёнными ингредиентами
+    new_keyboard = build_pizza_custom_keyboard(current_ingredients, user_data["base_price"], user_data["size"])
+    await callback.message.edit_reply_markup(reply_markup=new_keyboard)
+    await callback.answer(f"{'Добавлен' if new_grams > 0 else 'Удалён'} ингредиент: {INGREDIENTS[ingredient_key][0]} ({new_grams}г)")
+
+
+@dp.callback_query(F.data == "custom_done")
+async def custom_done(callback: types.CallbackQuery, state: FSMContext):
+    if await state.get_state() != OrderFlow.custom_pizza.state:
+        await callback.answer("❌ Сначала начните сборку пиццы.", show_alert=True)
+        return
+
+    user_data = user_custom_pizzas.get(callback.from_user.id)
+    if not user_data:
+        await callback.answer("❌ Ошибка данных сборки. Начните заново.", show_alert=True)
+        await state.clear()
+        return
+
+    size = user_data["size"]
+    size_name = "Маленькая" if size == "small" else "Большая"
+    ingredients = user_data["ingredients"]
+    base_price = user_data["base_price"]
+
+    total_extra = 0
+    for key, grams in ingredients.items():
+        if key in INGREDIENTS:
+            price_per_50g = INGREDIENTS[key][1]
+            total_extra += (grams // 50) * price_per_50g
+
+    total_price = base_price + total_extra
+    name = f"🍕 Собери сам ({size_name})"
+
+    item_key = get_item_key("custom", 0, size, custom=True, ingredients=ingredients)
+    add_to_cart_safe(callback.from_user.id, item_key, name, total_price, 1, details={"size": size, "ingredients": ingredients})
+
+    await state.clear()
+    await clear_active_messages(callback.from_user.id, bot)
+    del user_custom_pizzas[callback.from_user.id]
+
+    await callback.message.edit_caption(
+        caption=f"✅ <b>{name}</b> добавлена в корзину!\nЦена: <b>{total_price}₽</b>",
+        reply_markup=None,
+        parse_mode="HTML"
+    )
+    await callback.answer("✅ Пицца добавлена!")
+
+
+@dp.callback_query(F.data == "custom_cancel")
+async def custom_cancel(callback: types.CallbackQuery, state: FSMContext):
+    if await state.get_state() != OrderFlow.custom_pizza.state:
+        await callback.answer("❌ Нет активной сборки пиццы.", show_alert=True)
+        return
+
+    user_custom_pizzas.pop(callback.from_user.id, None)
+    await state.clear()
+    await clear_active_messages(callback.from_user.id, bot)
+
+    is_admin = (callback.from_user.id == ADMIN_USER_ID)
+    await callback.message.edit_caption(
+        caption="❌ Сборка пиццы отменена.",
+        reply_markup=None,
+        parse_mode="HTML"
+    )
+    await callback.message.answer("📂 Выберите раздел:", reply_markup=main_menu(is_admin=is_admin), parse_mode="HTML")
+    await callback.answer("❌ Сборка отменена.")
+
+
+# --- КОНЕЦ НОВЫХ ОБРАБОТЧИКОВ ---
+
 @dp.callback_query(F.data == "clear_cart")
 async def clear_cart(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -310,28 +399,17 @@ async def cart_manage(callback: types.CallbackQuery):
     elif action == "del":
         del cart[item_key]
 
-    if not cart:
-        try:
-            await callback.message.edit_text("ostringstream пуста.", parse_mode="HTML")
-        except TelegramBadRequest:
-            await callback.message.answer("ostringstream пуста.", parse_mode="HTML")
-        return
-
-    item = cart.get(item_key)
-    if item:
-        await callback.message.edit_reply_markup(reply_markup=cart_item_buttons(item_key, item["quantity"]))
-    else:
-        # Если редактируемое сообщение уже не содержит товара — покажем обновлённую корзину
-        await show_cart_by_callback(callback)
+    # После изменения корзины — перерисовываем всё сообщение
+    await show_cart_by_callback(callback)
 
 
 async def show_cart_by_callback(callback: types.CallbackQuery):
     cart = user_carts.get(callback.from_user.id, {})
     if not cart:
         try:
-            await callback.message.edit_text("ostringstream пуста.", parse_mode="HTML")
+            await callback.message.edit_text("🛒 Корзина пуста.", parse_mode="HTML")
         except TelegramBadRequest:
-            await callback.message.answer("ostringstream пуста.", parse_mode="HTML")
+            await callback.message.answer("🛒 Корзина пуста.", parse_mode="HTML")
         return
 
     subtotal = sum(item["price_per_unit"] * item["quantity"] for item in cart.values())
@@ -360,7 +438,7 @@ async def show_cart_by_callback(callback: types.CallbackQuery):
 async def show_cart(message: types.Message):
     cart = user_carts.get(message.from_user.id, {})
     if not cart:
-        await message.answer("ostringstream пуста.", parse_mode="HTML")
+        await message.answer("🛒 Корзина пуста.", parse_mode="HTML")
         return
 
     subtotal = sum(item["price_per_unit"] * item["quantity"] for item in cart.values())
@@ -390,7 +468,7 @@ async def show_user_orders(message: types.Message):
         return
 
     text = "📋 <b>Ваши последние заказы:</b>\n\n"
-    for order in orders[:5]: # Показываем последние 5
+    for order in orders[:5]:  # Показываем последние 5
         status_map = {
             "new": "🆕 Новый",
             "cooking": "🍳 Готовится",
@@ -464,7 +542,6 @@ async def handle_phone_contact(message: types.Message, state: FSMContext):
 async def handle_phone_text(message: types.Message, state: FSMContext):
     if await state.get_state() == OrderFlow.waiting_for_phone:
         phone_number = message.text
-        # Простая валидация номера (может быть улучшена)
         if phone_number.startswith(('+', '7', '8')) and len(phone_number) >= 10:
             await state.update_data(phone=phone_number)
             await message.answer(f"✅ Телефон: <code>{phone_number}</code> получен.", parse_mode="HTML")
@@ -595,6 +672,9 @@ async def payment_selected(callback: types.CallbackQuery, state: FSMContext):
             "🕒 Пицца уже в печи! 🍕",
             parse_mode="HTML"
         )
+        # Для наличных — сразу очищаем корзину и состояние
+        user_carts.pop(callback.from_user.id, None)
+        await state.clear()
 
     if KITCHEN_CHAT_ID:
         try:
@@ -617,8 +697,7 @@ async def payment_selected(callback: types.CallbackQuery, state: FSMContext):
             logger.error(f"Ошибка отправки уведомления на кухню: {e}")
 
     if payment != "💳 Онлайн":
-        user_carts.pop(callback.from_user.id, None)
-        await state.clear()
+        # Если оплата не онлайн — можно сразу вернуться в меню
         is_admin = (callback.from_user.id == ADMIN_USER_ID)
         await callback.message.answer("🙏 Спасибо за заказ! 🍕", reply_markup=main_menu(is_admin=is_admin), parse_mode="HTML")
 
@@ -680,7 +759,7 @@ async def admin_show_orders(callback: types.CallbackQuery):
     active_orders = [order for order in all_orders if order["status"] not in ('done', 'cancelled')]
 
     if not active_orders:
-        await callback.message.answer("ostringstream нет активных заказов.", parse_mode="HTML")
+        await callback.message.answer("🛒 Корзина пуста.", parse_mode="HTML")
         await callback.answer()
         return
 
@@ -788,24 +867,23 @@ async def admin_update_order_status(callback: types.CallbackQuery):
 
 async def on_startup(bot_app: web.Application):
     logger.info("🚀 Запуск бота...")
-    # render_url = os.getenv('RENDER_EXTERNAL_URL')
-    # logger.info(f"RENDER_EXTERNAL_URL = {render_url}")
+    render_url = os.getenv('RENDER_EXTERNAL_URL')
+    logger.info(f"RENDER_EXTERNAL_URL = {render_url}")
     logger.info(f"DATABASE_URL задан: {'Да' if os.getenv('DATABASE_URL') else 'Нет'}")
     await init_db()
     asyncio.create_task(cleanup_old_orders())
-    # if render_url:
-    #     webhook_url = f"{render_url.rstrip('/')}/webhook/{BOT_TOKEN}"
-    #     await bot.set_webhook(webhook_url)
-    #     logger.info(f"✅ Вебхук установлен: {webhook_url}")
-    # else:
-    #     logger.warning("⚠️ RENDER_EXTERNAL_URL не задан — вебхук не установлен!")
-    #     logger.warning("⚠️ На Render переменная RENDER_EXTERNAL_URL устанавливается автоматически.")
+    if render_url:
+        webhook_url = f"{render_url.rstrip('/')}/webhook/{BOT_TOKEN}"
+        await bot.set_webhook(webhook_url)
+        logger.info(f"✅ Вебхук установлен: {webhook_url}")
+    else:
+        logger.warning("⚠️ RENDER_EXTERNAL_URL не задан — вебхук не установлен!")
+        logger.warning("⚠️ На Render переменная RENDER_EXTERNAL_URL устанавливается автоматически. Проверьте конфигурацию сервиса.")
 
 
 async def on_shutdown(bot_app: web.Application):
     logger.info("🛑 Завершение работы бота...")
     try:
-        # await bot.delete_webhook(drop_pending_updates=True)
         await bot.session.close()
     except Exception as e:
         logger.error(f"Ошибка при завершении: {e}")

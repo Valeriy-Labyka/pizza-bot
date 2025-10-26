@@ -13,6 +13,9 @@ pool = None
 
 async def init_db():
     global pool
+    if not DATABASE_URL:
+        logger.error("❌ Переменная DATABASE_URL не установлена!")
+        raise ValueError("❌ Переменная DATABASE_URL не установлена!")
     try:
         pool = await asyncpg.create_pool(DATABASE_URL)
         logger.info("✅ Подключение к PostgreSQL установлено.")
@@ -202,6 +205,7 @@ async def update_order_status(order_id: int, new_status: str):
 
 
 async def delete_old_completed_orders():
+    global pool
     if pool is None:
         logger.error("❌ Попытка удалить старые заказы до инициализации пула соединений.")
         return
@@ -209,12 +213,17 @@ async def delete_old_completed_orders():
     one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
     async with pool.acquire() as conn:
         try:
-            result = await conn.execute(
-                "DELETE FROM orders WHERE status = ANY($1) AND created_at < $2",
+            # asyncpg не всегда возвращает корректное количество удалённых строк через .execute()
+            # Используем RETURNING для получения количества
+            deleted_rows = await conn.fetch(
+                "DELETE FROM orders WHERE status = ANY($1) AND created_at < $2 RETURNING id",
                 ["done", "cancelled"], one_hour_ago
             )
-            deleted_count = int(result.split()[-1]) if result.startswith("DELETE") else 0
-            logger.info(f"🧹 Удалено завершённых/отменённых заказов: {deleted_count}")
+            deleted_count = len(deleted_rows)
+            if deleted_count > 0:
+                logger.info(f"🧹 Удалено завершённых/отменённых заказов: {deleted_count}")
+            else:
+                logger.debug("🧹 Нет старых завершённых/отменённых заказов для удаления.")
         except Exception as e:
             logger.error(f"❌ Ошибка удаления старых заказов: {e}")
 
@@ -223,6 +232,7 @@ async def close_pool():
     global pool
     if pool:
         await pool.close()
+        pool = None  # Убедимся, что pool = None после закрытия
         logger.info("✅ Пул соединений закрыт.")
 
 

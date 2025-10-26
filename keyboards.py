@@ -44,6 +44,7 @@ def cart_item_buttons(item_key: str, quantity: int):
     if quantity <= 0:
         return cart_keyboard()  # Возвращаем основную клавиатуру корзины
 
+    # Кнопка с количеством не реагирует на нажатие
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="➖", callback_data=f"cart_dec_{item_key}"),
@@ -67,7 +68,8 @@ def payment_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Онлайн", callback_data="pay_online")],
         [InlineKeyboardButton(text="💵 Наличными", callback_data="pay_cash")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_cart")]
+        # Исправлено: нет обработчика back_to_cart, возвращаем в главное меню
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
     ])
 
 
